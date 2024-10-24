@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Shelly BLU Scanner</title>
+    <style>
+        body { 
+            font-family: system-ui;
+            line-height: 1.5;
+            margin: 0;
+            padding: 16px;
+            background: #f0f2f5;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        .card {
+            background: white;
+            border-radius: 8px;
+            padding: 16px;
+            margin: 16px 0;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        button {
+            background: #0088ff;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            margin-right: 8px;
+        }
+        button:disabled {
+            background: #ccc;
+        }
+        .device-card {
+            border-left: 4px solid #0088ff;
+            margin: 8px 0;
+            padding: 12px;
+            background: #f8f9fa;
+        }
+        .error { color: #dc3545; }
+        .success { color: #198754; }
+        pre {
+            background: #f8f9fa;
+            padding: 8px;
+            border-radius: 4px;
+            overflow-x: auto;
+        }
+        .log {
+            font-family: monospace;
+            font-size: 13px;
+            margin: 4px 0;
+        }
+        .ad-data {
+            margin-top: 8px;
+            padding: 8px;
+            background: #e9ecef;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="card">
+            <h1>Shelly BLU Scanner</h1>
+            
+            <div>
+                <button id="scanButton">Scan for Shelly Devices</button>
+                <button id="scanAllButton">Scan All BLE Devices</button>
+            </div>
+            
+            <div id="status"></div>
+            <div id="deviceList"></div>
+            <div id="log"></div>
+        </div>
+    </div>
+
+    <script>
+        const logDiv = document.getElementById('log');
+        const statusDiv = document.getElementById('status');
+        const deviceList = document.getElementById('deviceList');
+
+        function log(message, isError = false) {
+            const entry = document.createElement('div');
+            entry.className = 'log' + (isError ? ' error' : '');
+            entry.textContent = `${new Date().toLocaleTimeString()} ${message}`;
+            logDiv.insertBefore(entry, logDiv.firstChild);
+        }
+
+        // Convert array buffer to hex string for debugging
+        function bufferToHex(buffer) {
+            return Array.from(new Uint8Array(buffer))
+                .map(b => b.toString(16).padStart(2, '0'))
+                .join(' ');
+        }
+
+        // Parse Shelly BLU advertisement data
+        function parseShellyData(manufacturerData) {
+            try {
+                if (!manufacturerData) return null;
+                
+                const shellyData = manufacturerData.get(0x0C55); // Shelly manufacturer ID
+                if (!shellyData) return null;
+                
+                const data = new Uint8Array(shellyData);
+                if (data.length < 7) return null;
+
+                return {
+                    deviceType: data[0],
+                    battery: data[1],
+                    buttonPresses: data[2],
+                    temperature: (data[4] | (data[5] << 8)) / 100,
+                    humidity: data[6],
+                    rawData: Array.from(data).map(b => b.toString(16).padStart(2, '0')).join(' ')
+                };
+            } catch (err) {
+                console.error('Error parsing Shelly data:', err);
+                return null;
+            }
+        }
+
+        async function scanDevices(shellyOnly = true) {
+            try {
+                const scanButton = document.getElementById('scanButton');
+                const scanAllButton = document.getElementById('scanAllButton');
+                scanButton.disabled = true;
+                scanAllButton.disabled = true;
+                
+                log('Starting scan...');
+                statusDiv.textContent = 'Scanning...';
+                
+                const options = shellyOnly ? {
+                    filters: [{ namePrefix: 'SBT' }],
+                    optionalServices: ['battery_service', 'device_information']
+                } : {
+                    acceptAllDevices: true,
+                    optionalServices: ['battery_service', 'device_information']
+                };
+
+                const device = await navigator.bluetooth.requestDevice(options);
+                log(`Found device: ${device.name || 'Unknown'} (${device.id})`);
+
+                const deviceCard = document.createElement('div');
+                deviceCard.className = 'device-card';
+                deviceCard.innerHTML = `
+                    <h3>${device.name || 'Unknown Device'}</h3>
+                    <div>ID: ${device.id}</div>
+                `;
+
+                // For Shelly devices, watch advertisements
+                if (device.name?.startsWith('SBT')) {
+                    const adDataDiv = document.createElement('div');
+                    adDataDiv.className = 'ad-data';
+                    deviceCard.appendChild(adDataDiv);
+
+                    device.addEventListener('advertisementreceived', (event) => {
+                        log(`Advertisement received from ${device.name}`);
+                        
+                        const shellyData = parseShellyData(event.manufacturerData);
+                        if (shellyData) {
+                            adDataDiv.innerHTML = `
+                                <strong>Latest Data:</strong><br>
+                                Battery: ${shellyData.battery}%<br>
+                                Button Presses: ${shellyData.buttonPresses}<br>
+                                Temperature: ${shellyData.temperature}°C<br>
+                                Humidity: ${shellyData.humidity}%<br>
+                                Raw Data: ${shellyData.rawData}
+                            `;
+                        }
+                    });
+
+                    try {
+                        await device.watchAdvertisements();
+                        log('Watching for advertisements...');
+                    } catch (e) {
+                        log(`Could not watch advertisements: ${e.message}`, true);
+                    }
+                }
+
+                // Try to connect and get services
+                try {
+                    log('Connecting to GATT server...');
+                    const server = await device.gatt.connect();
+                    
+                    // Try battery service
+                    try {
+                        const batteryService = await server.getPrimaryService('battery_service');
+                        const batteryChar = await batteryService.getCharacteristic('battery_level');
+                        const batteryValue = await batteryChar.readValue();
+                        deviceCard.innerHTML += `<div>Battery Level: ${batteryValue.getUint8(0)}%</div>`;
+                    } catch (e) {
+                        log('Battery service not available');
+                    }
+
+                    // Try device information
+                    try {
+                        const infoService = await server.getPrimaryService('device_information');
+                        const manufacturer = await (await infoService.getCharacteristic('manufacturer_name_string')).readValue();
+                        const model = await (await infoService.getCharacteristic('model_number_string')).readValue();
+                        
+                        deviceCard.innerHTML += `
+                            <div>Manufacturer: ${new TextDecoder().decode(manufacturer)}</div>
+                            <div>Model: ${new TextDecoder().decode(model)}</div>
+                        `;
+                    } catch (e) {
+                        log('Device information not available');
+                    }
+
+                    log('Successfully connected to device');
+                    statusDiv.className = 'success';
+                    statusDiv.textContent = 'Connected!';
+                } catch (error) {
+                    log(`Connection failed: ${error.message}`, true);
+                }
+
+                deviceList.appendChild(deviceCard);
+
+            } catch (error) {
+                log(`Error: ${error.message}`, true);
+                statusDiv.className = 'error';
+                statusDiv.textContent = error.message;
+            } finally {
+                scanButton.disabled = false;
+                scanAllButton.disabled = false;
+            }
+        }
+
+        // Check if Web Bluetooth is available
+        if (!navigator.bluetooth) {
+            log('Web Bluetooth API is not available', true);
+            statusDiv.className = 'error';
+            statusDiv.textContent = 'Web Bluetooth is not supported in this browser';
+            document.getElementById('scanButton').disabled = true;
+            document.getElementById('scanAllButton').disabled = true;
+        }
+
+        document.getElementById('scanButton').addEventListener('click', () => scanDevices(true));
+        document.getElementById('scanAllButton').addEventListener('click', () => scanDevices(false));
+    </script>
+</body>
+</html>
